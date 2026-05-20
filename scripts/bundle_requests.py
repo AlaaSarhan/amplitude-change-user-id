@@ -102,28 +102,43 @@ def generate_curl_script(
     payload = create_payload(api_key, events)
     payload_json = json.dumps(payload, separators=(',', ':'))  # Compact JSON
 
-    # Create the shell script
     script_path = output_dir / f"batch_{batch_num:04d}.sh"
 
     # Escape single quotes in the JSON for shell
     escaped_json = payload_json.replace("'", "'\\''")
 
+    batch_label = f"batch_{batch_num:04d}"
+
     script_content = f"""#!/bin/bash
 # Batch {batch_num}: {len(events)} events
 # Payload size: {len(payload_json)} bytes
 
-curl -X POST '{endpoint}' \\
-  -H 'Content-Type: application/json' \\
-  -d '{escaped_json}'
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
 
-echo ""
-echo "Batch {batch_num} complete"
+RESPONSE=$(curl -s -w "\\n%{{http_code}}" -X POST '{endpoint}' \\
+  -H 'Content-Type: application/json' \\
+  -d '{escaped_json}')
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | head -n -1)
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+ENTRY="[$TIMESTAMP] {batch_label} HTTP $HTTP_CODE $BODY"
+
+if [ "$HTTP_CODE" = "200" ]; then
+    echo "$ENTRY" >> "$LOG_DIR/success.log"
+    echo "Batch {batch_num} complete (HTTP $HTTP_CODE)"
+else
+    echo "$ENTRY" >> "$LOG_DIR/failed.log"
+    echo "Batch {batch_num} FAILED (HTTP $HTTP_CODE): $BODY" >&2
+    exit 1
+fi
 """
 
     with open(script_path, 'w', encoding='utf-8') as f:
         f.write(script_content)
 
-    # Make executable
     os.chmod(script_path, 0o755)
 
     return script_path
@@ -135,11 +150,11 @@ def generate_run_all_script(output_dir: Path, num_batches: int, delay_seconds: i
 
     script_content = f"""#!/bin/bash
 # Run all {num_batches} batch scripts with {delay_seconds} second delay between each
-# This helps respect rate limits
-
-set -e
+# Logs written to ./logs/success.log and ./logs/failed.log
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+FAILED=0
 
 echo "Starting upload of {num_batches} batches..."
 echo ""
@@ -148,10 +163,11 @@ for i in $(seq -f "%04g" 1 {num_batches}); do
     script="$SCRIPT_DIR/batch_$i.sh"
     if [ -f "$script" ]; then
         echo "Running batch $i of {num_batches}..."
-        bash "$script"
+        if ! bash "$script"; then
+            FAILED=$((FAILED + 1))
+        fi
         echo ""
 
-        # Delay between batches (except after the last one)
         if [ "$i" -lt "{num_batches:04d}" ]; then
             echo "Waiting {delay_seconds} second(s) before next batch..."
             sleep {delay_seconds}
@@ -159,8 +175,16 @@ for i in $(seq -f "%04g" 1 {num_batches}); do
     fi
 done
 
+SUCCESS_COUNT=$(wc -l < "$LOG_DIR/success.log" 2>/dev/null || echo 0)
+FAILED_COUNT=$(wc -l < "$LOG_DIR/failed.log" 2>/dev/null || echo 0)
+
 echo ""
-echo "All batches complete!"
+echo "All batches finished."
+echo "  Succeeded: $SUCCESS_COUNT"
+echo "  Failed:    $FAILED_COUNT"
+[ "$FAILED_COUNT" -gt 0 ] && echo "  See $LOG_DIR/failed.log for details"
+
+exit $FAILED
 """
 
     with open(script_path, 'w', encoding='utf-8') as f:
