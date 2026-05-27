@@ -1,6 +1,8 @@
 # amplitude-change-user-id
 A tool to change your Amplitude User IDs
 
+All code has been generated using Claude Code. Has not been tested for production by the author yet.
+
 ## Usage
 
 Run the following scripts in order:
